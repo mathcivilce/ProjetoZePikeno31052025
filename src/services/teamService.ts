@@ -145,79 +145,32 @@ export class TeamService {
     try {
       console.log('TeamService: getTeamMembers() called');
       
-      // First, get current user's business_id
-      console.log('TeamService: Fetching current user profile for business_id...');
-      const { data: currentProfile, error: profileError } = await supabase
-        .from('user_profiles')
-        .select('business_id, user_id')
-        .single();
-
-      console.log('TeamService: Current profile result:', { 
-        currentProfile, 
-        profileError: profileError?.message,
-        businessId: currentProfile?.business_id 
-      });
-
-      if (profileError) {
-        console.error('TeamService: Error fetching current profile:', profileError);
-        throw profileError;
-      }
-
-      if (!currentProfile?.business_id) {
-        console.log('TeamService: No business_id found, returning empty array');
+      // Get current user session for authorization
+      const { data: session } = await supabase.auth.getSession();
+      if (!session.session?.access_token) {
+        console.error('TeamService: No session found');
         return [];
       }
 
-      // Get current user's email from auth
-      const { data: authUser } = await supabase.auth.getUser();
-      const currentUserEmail = authUser.user?.email || '';
-      console.log('TeamService: Current user email:', currentUserEmail);
-
-      // Fetch all user profiles with the same business_id
-      console.log('TeamService: Fetching team members with business_id:', currentProfile.business_id);
-      const { data: profiles, error } = await supabase
-        .from('user_profiles')
-        .select('*')
-        .eq('business_id', currentProfile.business_id);
-
-      console.log('TeamService: Team members query result:', { 
-        profilesCount: profiles?.length || 0,
-        profiles: profiles,
-        error: error?.message,
-        errorDetails: error
+      // Call the Edge Function to get team members with emails
+      const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/get-team-members`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${session.session.access_token}`,
+        },
       });
 
-      if (error) {
-        console.error('TeamService: Error fetching team members:', error);
-        throw error;
+      if (!response.ok) {
+        const errorData = await response.json();
+        console.error('TeamService: Edge Function error:', errorData);
+        throw new Error(errorData.error || 'Failed to fetch team members');
       }
 
-      // Map profiles to team members, using current user's email for their own profile
-      const teamMembers = (profiles || []).map((profile: any) => {
-        // If this is the current user, use their auth email
-        const email = profile.user_id === currentProfile.user_id 
-          ? currentUserEmail 
-          : 'Private'; // For other users, we can't access their emails without admin permissions
-
-        return {
-          id: profile.id,
-          user_id: profile.user_id,
-          email: email,
-          first_name: profile.first_name,
-          last_name: profile.last_name,
-          job_title: profile.job_title,
-          role: profile.role,
-          status: 'active',
-          business_id: profile.business_id,
-          business_name: profile.business_name,
-          invited_by: profile.invited_by,
-          created_at: profile.created_at,
-          last_active: profile.updated_at,
-        };
-      });
-
-      console.log('TeamService: Returning team members:', teamMembers);
-      return teamMembers;
+      const data = await response.json();
+      console.log('TeamService: Received team members from Edge Function:', data.teamMembers);
+      
+      return data.teamMembers || [];
     } catch (error) {
       console.error('TeamService: Error fetching team members:', error);
       console.error('TeamService: Error details:', {
