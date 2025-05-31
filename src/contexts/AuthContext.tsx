@@ -136,7 +136,8 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
   const signUp = async (email: string, password: string, metadata?: any) => {
     try {
       setLoading(true);
-      const { error } = await supabase.auth.signUp({
+      
+      const { data, error } = await supabase.auth.signUp({
         email,
         password,
         options: {
@@ -144,6 +145,29 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
           emailRedirectTo: `${window.location.origin}/dashboard`,
         },
       });
+
+      // If this is an invitation-based signup, call the accept-invitation function
+      if (!error && metadata?.invitation_token && data.user) {
+        try {
+          const acceptResponse = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/accept-invitation`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+            },
+            body: JSON.stringify({ 
+              token: metadata.invitation_token,
+              user_id: data.user.id 
+            }),
+          });
+          
+          if (!acceptResponse.ok) {
+            console.warn('Failed to process invitation acceptance');
+          }
+        } catch (inviteError) {
+          console.warn('Error processing invitation:', inviteError);
+        }
+      }
 
       return { error };
     } catch (error) {
