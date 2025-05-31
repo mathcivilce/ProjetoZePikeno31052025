@@ -167,6 +167,7 @@ const AcceptInvitation: React.FC = () => {
       if (!errors[key]) delete errors[key];
     });
     
+    console.log('Form validation:', { errors, fieldErrors });
     setFieldErrors(errors);
     return Object.keys(errors).length === 0;
   };
@@ -520,7 +521,7 @@ const AcceptInvitation: React.FC = () => {
             <div>
               <button
                 type="submit"
-                disabled={submitting || Object.keys(fieldErrors).length > 0}
+                disabled={submitting || !firstName.trim() || !lastName.trim() || !jobTitle.trim() || !password || !passwordConfirmation || password !== passwordConfirmation || passwordRequirements.some(req => !req.met)}
                 className="w-full flex justify-center py-2 px-4 border border-transparent rounded-md shadow-sm text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-blue-500 disabled:opacity-50 disabled:cursor-not-allowed"
               >
                 {submitting ? (
