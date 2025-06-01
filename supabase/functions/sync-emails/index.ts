@@ -35,14 +35,6 @@ serve(async (req) => {
   }
 
   try {
-    const { storeId } = await req.json();
-    
-    if (!storeId) {
-      throw new Error('Store ID is required');
-    }
-
-    console.log(`Processing sync request for store: ${storeId}`);
-
     const supabase = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? '',
@@ -54,72 +46,125 @@ serve(async (req) => {
       }
     );
 
+    const { storeId, syncFrom, syncTo } = await req.json();
+
+    if (!storeId) {
+      throw new Error('Store ID is required');
+    }
+
+    console.log(`Starting sync for store ${storeId}`);
+
     const { data: store, error: storeError } = await supabase
       .from('stores')
       .select('*')
       .eq('id', storeId)
       .single();
 
-    if (storeError) {
-      console.error('Store fetch error:', storeError);
-      throw new Error(`Store not found: ${storeError.message}`);
-    }
+    if (storeError) throw storeError;
+    if (!store) throw new Error('Store not found');
 
-    if (!store) {
-      throw new Error('Store not found');
-    }
+    console.log(`Store found: ${store.name} (${store.email})`);
 
-    if (!store.access_token) {
-      throw new Error('Store has no access token');
-    }
+    let accessToken = store.access_token;
 
-    const { data: latestEmail, error: emailError } = await supabase
-      .from('emails')
-      .select('date')
-      .eq('store_id', storeId)
-      .order('date', { ascending: false })
-      .limit(1)
-      .single();
-
-    if (emailError && emailError.code !== 'PGRST116') {
-      throw emailError;
-    }
-
-    const syncFrom = latestEmail
-      ? new Date(latestEmail.date)
-      : new Date(Date.now() - 24 * 60 * 60 * 1000);
-
-    const filter = `receivedDateTime gt ${syncFrom.toISOString()}`;
-    console.log(`Fetching emails since ${syncFrom.toISOString()}`);
-
-    const graphClient = Client.init({
-      authProvider: (done) => {
-        done(null, store.access_token);
-      }
-    });
-
-    try {
-      console.log('Testing Microsoft Graph API token...');
-      await retryOperation(() => graphClient.api('/me').get());
-      console.log('Token validation successful');
-    } catch (error) {
-      console.error('Token validation failed:', {
-        status: error.statusCode,
-        message: error.message,
-        body: error.body
+    // Function to refresh token if needed
+    const refreshTokenIfNeeded = async () => {
+      console.log('Attempting to refresh token...');
+      const refreshResponse = await fetch(`${Deno.env.get('SUPABASE_URL')}/functions/v1/refresh-tokens`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')}`
+        },
+        body: JSON.stringify({ storeId: store.id })
       });
-      
-      await supabase
+
+      if (!refreshResponse.ok) {
+        throw new Error(`Token refresh failed: ${refreshResponse.status}`);
+      }
+
+      const refreshResult = await refreshResponse.json();
+      if (!refreshResult.success) {
+        throw new Error(refreshResult.error || 'Token refresh failed');
+      }
+
+      // Get updated store data
+      const { data: updatedStore, error: updateError } = await supabase
         .from('stores')
-        .update({ 
-          status: 'issue',
-          connected: false,
-          last_synced: new Date().toISOString()
-        })
-        .eq('id', storeId);
-        
-      throw new Error(`Invalid or expired access token: ${error.message}`);
-    }
+        .select('access_token')
+        .eq('id', storeId)
+        .single();
+
+      if (updateError) throw updateError;
+      
+      accessToken = updatedStore.access_token;
+      console.log('Token refreshed successfully');
+      return accessToken;
+    };
+
+    // Create Graph client with current token
+    const createGraphClient = (token: string) => {
+      return Client.init({
+        authProvider: (done) => {
+          done(null, token);
+        }
+      });
+    };
+
+    let graphClient = createGraphClient(accessToken);
+
+    // Set up date filter
+    const now = new Date();
+    const syncFromDate = syncFrom ? new Date(syncFrom) : new Date(now.getTime() - (7 * 24 * 60 * 60 * 1000));
+    const syncToDate = syncTo ? new Date(syncTo) : now;
+
+    const filter = `receivedDateTime ge ${syncFromDate.toISOString()} and receivedDateTime le ${syncToDate.toISOString()}`;
+
+    console.log(`Syncing emails from ${syncFromDate.toISOString()} to ${syncToDate.toISOString()}`);
+
+    // Test token validity with retry logic
+    const testTokenWithRetry = async (maxRetries = 1) => {
+      for (let attempt = 0; attempt <= maxRetries; attempt++) {
+        try {
+          console.log(`Testing Microsoft Graph API token (attempt ${attempt + 1})...`);
+          await retryOperation(() => graphClient.api('/me').get());
+          console.log('Token validation successful');
+          return;
+        } catch (error) {
+          console.error('Token validation failed:', {
+            status: error.statusCode,
+            message: error.message,
+            attempt: attempt + 1
+          });
+          
+          if (error.statusCode === 401 && attempt < maxRetries) {
+            // Token expired, try to refresh
+            try {
+              const newToken = await refreshTokenIfNeeded();
+              graphClient = createGraphClient(newToken);
+              console.log('Retrying with refreshed token...');
+            } catch (refreshError) {
+              console.error('Token refresh failed:', refreshError);
+              throw refreshError;
+            }
+          } else {
+            // Update store status if token is permanently invalid
+            await supabase
+              .from('stores')
+              .update({ 
+                status: 'issue',
+                connected: false,
+                last_synced: new Date().toISOString()
+              })
+              .eq('id', storeId);
+              
+            throw new Error(`Invalid or expired access token: ${error.message}`);
+          }
+        }
+      }
+    };
+
+    await testTokenWithRetry(1);
 
     let allEmails = [];
     let nextLink = null;
@@ -136,7 +181,7 @@ serve(async (req) => {
           const fetchResponse = await retryOperation(() => 
             fetch(nextLink, {
               headers: {
-                'Authorization': `Bearer ${store.access_token}`,
+                'Authorization': `Bearer ${accessToken}`,
                 'Content-Type': 'application/json'
               }
             })

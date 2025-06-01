@@ -14,8 +14,9 @@ interface EmailListProps {
 const ITEMS_PER_PAGE = 20;
 
 const EmailList: React.FC<EmailListProps> = ({ storeId }) => {
-  const { emails, stores, loading, error, syncEmails } = useInbox();
+  const { emails, stores, loading, error, syncEmails, refreshEmails } = useInbox();
   const [syncing, setSyncing] = useState(false);
+  const [refreshing, setRefreshing] = useState(false);
   const navigate = useNavigate();
   const [sortBy, setSortBy] = useState('date');
   const [sortDirection, setSortDirection] = useState('desc');
@@ -44,6 +45,17 @@ const EmailList: React.FC<EmailListProps> = ({ storeId }) => {
       console.error('Error syncing emails:', error);
     } finally {
       setSyncing(false);
+    }
+  };
+
+  const handleRefresh = async () => {
+    try {
+      setRefreshing(true);
+      await refreshEmails();
+    } catch (error) {
+      console.error('Error refreshing emails:', error);
+    } finally {
+      setRefreshing(false);
     }
   };
 
@@ -252,22 +264,37 @@ const EmailList: React.FC<EmailListProps> = ({ storeId }) => {
         <div className="flex items-center space-x-2 text-sm text-gray-500">
           <Clock size={16} className="text-gray-400" />
           <span>Last synced: {formatLastSynced(store?.lastSynced)}</span>
-          {syncing && (
+          {(syncing || refreshing) && (
             <span className="text-blue-600 flex items-center">
               <RefreshCw size={14} className="animate-spin mr-1" />
-              Syncing...
+              {syncing ? 'Syncing...' : 'Refreshing...'}
             </span>
           )}
         </div>
         
-        <button
-          onClick={handleSync}
-          disabled={syncing || loading}
-          className="inline-flex items-center px-3 py-1.5 text-sm font-medium rounded-md text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50"
-        >
-          <RefreshCw size={16} className={`mr-2 ${syncing ? 'animate-spin' : ''}`} />
-          {syncing ? 'Syncing...' : 'Sync Now'}
-        </button>
+        <div className="flex items-center space-x-2">
+          <button
+            onClick={handleRefresh}
+            disabled={refreshing || loading}
+            className="inline-flex items-center px-3 py-1.5 text-sm font-medium rounded-md text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50"
+            title="Refresh emails from database"
+          >
+            <RefreshCw size={16} className={`mr-2 ${refreshing ? 'animate-spin' : ''}`} />
+            {refreshing ? 'Refreshing...' : 'Refresh'}
+          </button>
+          
+          {store && (
+            <button
+              onClick={handleSync}
+              disabled={syncing || loading}
+              className="inline-flex items-center px-3 py-1.5 text-sm font-medium rounded-md text-gray-700 bg-white border border-gray-300 hover:bg-gray-50 disabled:opacity-50"
+              title="Sync new emails from Microsoft"
+            >
+              <RefreshCw size={16} className={`mr-2 ${syncing ? 'animate-spin' : ''}`} />
+              {syncing ? 'Syncing...' : 'Sync New'}
+            </button>
+          )}
+        </div>
       </div>
 
       <div className="flex items-center px-4 py-2 border-b border-gray-200 bg-gray-50 text-xs font-medium text-gray-500 uppercase tracking-wider">

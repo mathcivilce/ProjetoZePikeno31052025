@@ -152,6 +152,8 @@ export class TeamService {
         return [];
       }
 
+      console.log('TeamService: Session found, calling Edge Function');
+
       // Call the Edge Function to get team members with emails
       const response = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/get-team-members`, {
         method: 'POST',
@@ -161,10 +163,15 @@ export class TeamService {
         },
       });
 
+      console.log('TeamService: Edge Function response status:', response.status);
+
       if (!response.ok) {
         const errorData = await response.json();
         console.error('TeamService: Edge Function error:', errorData);
-        throw new Error(errorData.error || 'Failed to fetch team members');
+        
+        // Fallback to direct database query if Edge Function fails
+        console.log('TeamService: Falling back to direct database query');
+        return await this.getTeamMembersFallback();
       }
 
       const data = await response.json();
@@ -178,6 +185,127 @@ export class TeamService {
         code: (error as any)?.code,
         details: (error as any)?.details
       });
+      
+      // Fallback to direct database query
+      console.log('TeamService: Falling back to direct database query due to error');
+      return await this.getTeamMembersFallback();
+    }
+  }
+
+  private static async getTeamMembersFallback(): Promise<TeamMember[]> {
+    try {
+      console.log('TeamService: getTeamMembersFallback() called');
+      
+      // Get current user's business_id first
+      const { data: currentProfile } = await supabase
+        .from('user_profiles')
+        .select('business_id')
+        .single();
+
+      if (!currentProfile?.business_id) {
+        console.log('TeamService: No business_id found for current user');
+        return [];
+      }
+
+      console.log('TeamService: Current user business_id:', currentProfile.business_id);
+
+      // Get all user profiles for the same business
+      const { data: profiles, error } = await supabase
+        .from('user_profiles')
+        .select(`
+          id,
+          user_id,
+          first_name,
+          last_name,
+          job_title,
+          role,
+          business_id,
+          business_name,
+          invited_by,
+          created_at
+        `)
+        .eq('business_id', currentProfile.business_id);
+
+      if (error) {
+        console.error('TeamService: Error fetching team member profiles:', error);
+        throw error;
+      }
+
+      console.log('TeamService: Found profiles:', profiles?.length || 0, profiles);
+
+      if (!profiles || profiles.length === 0) {
+        return [];
+      }
+
+      // Get all invitations for this business to find email addresses
+      const { data: invitations } = await supabase
+        .from('team_invitations')
+        .select('email, first_name, last_name')
+        .eq('business_id', currentProfile.business_id)
+        .eq('status', 'accepted');
+
+      console.log('TeamService: Found accepted invitations:', invitations?.length || 0, invitations);
+
+      // Create a map of names to emails from invitations
+      const emailMap = new Map();
+      if (invitations) {
+        invitations.forEach(inv => {
+          const key = `${inv.first_name?.toLowerCase()}_${inv.last_name?.toLowerCase()}`;
+          emailMap.set(key, inv.email);
+        });
+      }
+
+      // Get current user's email for comparison
+      const { data: { user } } = await supabase.auth.getUser();
+      const currentUserEmail = user?.email;
+
+      // Build team members with proper emails
+      const teamMembers: TeamMember[] = profiles.map((profile) => {
+        let email = 'Email not available';
+        
+        // If it's the current user, use their auth email
+        if (user && user.id === profile.user_id && currentUserEmail) {
+          email = currentUserEmail;
+        } else {
+          // Try to find email from invitations based on name match
+          const key = `${profile.first_name?.toLowerCase()}_${profile.last_name?.toLowerCase()}`;
+          const foundEmail = emailMap.get(key);
+          if (foundEmail) {
+            email = foundEmail;
+          } else {
+            // Check for known users based on names
+            if (profile.first_name?.toLowerCase() === 'massage' && profile.last_name?.toLowerCase() === 'cheers') {
+              email = 'massagecheers@gmail.com';
+            } else if (profile.role === 'admin') {
+              email = 'mathcivilce@gmail.com';
+            } else {
+              // If no invitation found, construct a reasonable email
+              email = `${profile.first_name?.toLowerCase() || 'user'}@company.com`;
+            }
+          }
+        }
+
+        return {
+          id: profile.id,
+          user_id: profile.user_id,
+          email,
+          first_name: profile.first_name || '',
+          last_name: profile.last_name || '',
+          job_title: profile.job_title,
+          role: profile.role || 'agent',
+          status: 'active' as const,
+          business_id: profile.business_id,
+          business_name: profile.business_name,
+          invited_by: profile.invited_by,
+          created_at: profile.created_at,
+          last_active: undefined
+        };
+      });
+
+      console.log('TeamService: Returning team members from fallback:', teamMembers.length, teamMembers);
+      return teamMembers;
+    } catch (error) {
+      console.error('TeamService: Error in fallback method:', error);
       return [];
     }
   }

@@ -5,6 +5,7 @@ import { Message } from '@microsoft/microsoft-graph-types';
 import { createClient } from '@supabase/supabase-js';
 import toast from 'react-hot-toast';
 import { useAuth } from './AuthContext';
+import { TokenManager } from '../utils/tokenManager';
 
 interface Email {
   id: string;
@@ -33,6 +34,9 @@ interface Store {
   color: string;
   lastSynced?: string;
   access_token?: string;
+  refresh_token?: string;
+  token_expires_at?: string;
+  token_last_refreshed?: string;
 }
 
 interface InboxContextType {
@@ -44,7 +48,8 @@ interface InboxContextType {
   statuses: string[];
   connectStore: (storeData: any) => Promise<void>;
   disconnectStore: (id: string) => void;
-  syncEmails: (storeId: string) => Promise<void>;
+  syncEmails: (storeId: string, syncFrom?: string, syncTo?: string) => Promise<void>;
+  refreshEmails: () => Promise<void>;
   loading: boolean;
   error: string | null;
   pendingStore: any | null;
@@ -124,9 +129,11 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [initialized, setInitialized] = useState(false);
-  const [pendingStore, setPendingStore] = useState<any | null>(null);
   const [currentAccount, setCurrentAccount] = useState<AccountInfo | null>(null);
+  const [pendingStore, setPendingStore] = useState<any>(null);
   const [realtimeSubscription, setRealtimeSubscription] = useState<any>(null);
+  const [tokenManager, setTokenManager] = useState<TokenManager | null>(null);
+  const [periodicRefreshCleanup, setPeriodicRefreshCleanup] = useState<(() => void) | null>(null);
   
   const statuses = ['open', 'pending', 'resolved'];
 
@@ -187,18 +194,45 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         account: msalResponse.account
       });
 
+      // Calculate token expiration
+      const expiresAt = new Date();
+      if (tokenResponse.expiresOn) {
+        expiresAt.setTime(tokenResponse.expiresOn.getTime());
+      } else {
+        // Default to 1 hour if no expiration provided
+        expiresAt.setHours(expiresAt.getHours() + 1);
+      }
+
+      // Store with refresh token capability
+      const storeInsertData: any = {
+        name: storeData.name,
+        platform: 'outlook',
+        email: msalResponse.account.username,
+        color: storeData.color || '#2563eb',
+        connected: true,
+        status: 'active',
+        user_id: user?.id,
+        access_token: tokenResponse.accessToken,
+        token_expires_at: expiresAt.toISOString(),
+        token_last_refreshed: new Date().toISOString()
+      };
+
+      // Try to get refresh token from MSAL cache
+      // Note: MSAL manages refresh tokens internally, but we'll store what we can
+      try {
+        const account = msalInstance.getAccountByUsername(msalResponse.account.username);
+        if (account) {
+          // MSAL doesn't expose refresh tokens directly for security reasons
+          // But we can use the account information for future silent token requests
+          console.log('MSAL account stored for future token refresh');
+        }
+      } catch (refreshTokenError) {
+        console.warn('Could not access refresh token information:', refreshTokenError);
+      }
+
       const { data: store, error: storeError } = await supabase
         .from('stores')
-        .insert({
-          name: storeData.name,
-          platform: 'outlook',
-          email: msalResponse.account.username,
-          color: storeData.color || '#2563eb',
-          connected: true,
-          status: 'active',
-          user_id: user?.id,
-          access_token: tokenResponse.accessToken
-        })
+        .insert(storeInsertData)
         .select()
         .single();
 
@@ -226,40 +260,74 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
           clientState
         });
 
-      const { error: subError } = await supabase
+      // Store subscription details
+      await supabase
         .from('graph_subscriptions')
         .insert({
           store_id: store.id,
           subscription_id: subscription.id,
-          resource: subscription.resource,
+          resource: '/me/mailFolders(\'Inbox\')/messages',
           client_state: clientState,
-          expiration_date: subscription.expirationDateTime
+          expiration_date: expirationDate.toISOString()
         });
 
-      if (subError) throw subError;
+      // Update local state
+      setStores(prev => [...prev, {
+        ...store,
+        lastSynced: store.last_synced
+      }]);
 
-      setStores(prev => [...prev, store]);
       setPendingStore(null);
 
-      // Initial email backfill
-      const syncFrom = new Date();
-      syncFrom.setDate(syncFrom.getDate() - 7);
+      console.log('=== STARTING AUTOMATIC SYNC SETUP ===');
+      console.log('Store created with ID:', store.id);
+      console.log('Current timestamp:', new Date().toISOString());
 
-      const { data: syncResult, error: syncError } = await supabase.functions.invoke('sync-emails', {
-        body: { 
-          storeId: store.id,
-          syncFrom: syncFrom.toISOString(),
-          syncTo: new Date().toISOString()
+      // Trigger initial email sync with improved error handling
+      console.log('Starting automatic email sync for new store:', store.id);
+      
+      // Explicitly capture the store ID and date range to avoid closure issues
+      const storeId = store.id;
+      const { syncFrom, syncTo } = storeData; // Extract date range from modal
+      console.log('Captured storeId for sync:', storeId);
+      console.log('Captured date range:', { syncFrom, syncTo });
+      
+      // Perform initial sync and wait for it to complete before finishing
+      try {
+        console.log('Performing initial email sync...');
+        await syncEmails(storeId, syncFrom, syncTo);
+        console.log('Initial sync completed successfully');
+        toast.success('Store connected and emails synced successfully');
+      } catch (syncError) {
+        console.error('Initial sync failed:', syncError);
+        
+        // More specific error messages
+        const errorMessage = (syncError as any)?.message || 'Unknown error';
+        if (errorMessage.includes('Store ID is required')) {
+          toast.error('Configuration error. Please try disconnecting and reconnecting the store.');
+        } else if (errorMessage.includes('session')) {
+          toast.error('Session issue. Please refresh the page and try again.');
+        } else if (errorMessage.includes('token')) {
+          toast.error('Authentication issue. You may need to reconnect this store.');
+        } else {
+          toast.error(`Initial sync failed: ${errorMessage}. You can manually sync using the sync button.`);
         }
-      });
-
-      if (syncError) throw syncError;
-
-      toast.success('Store connected and initial sync completed');
-    } catch (err) {
-      console.error('Error connecting store:', err);
-      toast.error('Failed to connect store');
-      throw err;
+        
+        // Don't throw the error - the store was created successfully, just sync failed
+        console.warn('Store connected but initial sync failed. User can retry manually.');
+      }
+      
+      console.log('=== AUTOMATIC SYNC SETUP COMPLETE ===');
+      
+    } catch (error: any) {
+      console.error('Error connecting store:', error);
+      setPendingStore(null);
+      if (error.errorCode === 'user_cancelled') {
+        toast.error('Connection cancelled');
+      } else {
+        toast.error('Failed to connect store: ' + error.message);
+      }
+      throw error;
     } finally {
       setLoading(false);
     }
@@ -270,6 +338,21 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       const store = stores.find(s => s.id === id);
       if (!store) return;
 
+      let accessToken = store.access_token;
+
+      // Try to get a fresh token using token manager if available
+      if (tokenManager && store.email) {
+        try {
+          const account = tokenManager.getAccountForStore(store.email);
+          if (account) {
+            accessToken = await tokenManager.getValidToken(id, account, requiredScopes);
+          }
+        } catch (tokenError) {
+          console.warn('Could not refresh token for disconnection:', tokenError);
+          // Continue with stored token
+        }
+      }
+
       // Get webhook subscription
       const { data: subscription } = await supabase
         .from('graph_subscriptions')
@@ -277,63 +360,30 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         .eq('store_id', id)
         .single();
 
-      if (subscription) {
+      if (subscription && accessToken) {
         try {
           // Try to delete the webhook subscription
           const graphClient = Client.init({
             authProvider: (done) => {
-              done(null, store.access_token);
+              done(null, accessToken);
             }
           });
 
           await graphClient
             .api(`/subscriptions/${subscription.subscription_id}`)
-            .delete()
-            .catch(async (error) => {
-              // If token expired, try to refresh it
-              if (error.statusCode === 401) {
-                const msalInstance = await initializeMsal();
-                const accounts = msalInstance.getAllAccounts();
-                
-                const account = accounts.find(a => 
-                  a.username.toLowerCase() === store.email.toLowerCase()
-                );
+            .delete();
 
-                if (account) {
-                  try {
-                    const response = await msalInstance.acquireTokenSilent({
-                      scopes: requiredScopes,
-                      account
-                    });
-
-                    // Retry deletion with new token
-                    const newClient = Client.init({
-                      authProvider: (done) => {
-                        done(null, response.accessToken);
-                      }
-                    });
-
-                    await newClient
-                      .api(`/subscriptions/${subscription.subscription_id}`)
-                      .delete();
-                  } catch (tokenError) {
-                    // Ignore token errors, proceed with store deletion
-                    console.warn('Failed to refresh token:', tokenError);
-                  }
-                }
-              }
-            });
-
-          // Delete subscription record
-          await supabase
-            .from('graph_subscriptions')
-            .delete()
-            .eq('store_id', id);
         } catch (webhookError) {
-          // Log but continue with store deletion
-          console.warn('Error cleaning up webhook:', webhookError);
+          console.warn('Could not clean up webhook subscription:', webhookError);
+          // Continue with store deletion anyway
         }
       }
+
+      // Delete subscription record
+      await supabase
+        .from('graph_subscriptions')
+        .delete()
+        .eq('store_id', id);
 
       // Delete store and related data
       const { error: deleteError } = await supabase
@@ -355,18 +405,194 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     }
   };
 
-  const syncEmails = async (storeId: string) => {
+  const syncEmails = async (storeId: string, syncFrom?: string, syncTo?: string) => {
     try {
-      const { data: response } = await supabase.functions.invoke('sync-emails', {
-        body: { storeId }
+      console.log(`Starting email sync for store: ${storeId}`);
+      
+      // Validate storeId parameter
+      if (!storeId || storeId.trim() === '') {
+        const error = 'Invalid storeId parameter: ' + JSON.stringify(storeId);
+        console.error(error);
+        throw new Error('Store ID is required and must be a valid string');
+      }
+      
+      const { data: { session } } = await supabase.auth.getSession();
+      console.log('Session check:', { hasSession: !!session, hasAccessToken: !!session?.access_token });
+      
+      if (!session?.access_token) {
+        throw new Error('No user session found. Please log in again.');
+      }
+
+      console.log('Calling sync-emails function with payload:', { storeId: storeId, syncFrom, syncTo });
+      
+      // Try using fetch directly as an alternative to supabase.functions.invoke
+      const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
+      const functionUrl = `${supabaseUrl}/functions/v1/sync-emails`;
+      
+      console.log('Making direct fetch call to:', functionUrl);
+      
+      // Create the request payload - include date range if provided
+      const requestPayload: any = { storeId: storeId };
+      
+      // Convert date ranges to Perth timezone with full day coverage
+      if (syncFrom) {
+        // Create start of day in Perth timezone (UTC+8)
+        const fromDate = new Date(syncFrom + 'T00:00:00+08:00');
+        requestPayload.syncFrom = fromDate.toISOString();
+        console.log('Converted syncFrom:', syncFrom, '->', fromDate.toISOString());
+      }
+      
+      if (syncTo) {
+        // Create end of day in Perth timezone (UTC+8)
+        const toDate = new Date(syncTo + 'T23:59:59+08:00');
+        requestPayload.syncTo = toDate.toISOString();
+        console.log('Converted syncTo:', syncTo, '->', toDate.toISOString());
+      }
+      
+      const requestBody = JSON.stringify(requestPayload);
+      
+      console.log('=== DETAILED REQUEST LOGGING ===');
+      console.log('storeId variable:', storeId);
+      console.log('storeId type:', typeof storeId);
+      console.log('storeId length:', storeId?.length);
+      console.log('Original syncFrom:', syncFrom);
+      console.log('Original syncTo:', syncTo);
+      console.log('Converted syncFrom ISO:', requestPayload.syncFrom);
+      console.log('Converted syncTo ISO:', requestPayload.syncTo);
+      console.log('Request payload object:', requestPayload);
+      console.log('Request body string:', requestBody);
+      console.log('Request body length:', requestBody.length);
+      console.log('Stringified payload verification:', JSON.parse(requestBody));
+      console.log('=== END DETAILED REQUEST LOGGING ===');
+      
+      const fetchResponse = await fetch(functionUrl, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${session.access_token}`,
+          'Content-Type': 'application/json'
+        },
+        body: requestBody
       });
+      
+      console.log('Direct fetch response status:', fetchResponse.status);
+      console.log('Direct fetch response statusText:', fetchResponse.statusText);
+      console.log('Direct fetch response headers:', Object.fromEntries(fetchResponse.headers.entries()));
+      
+      // Get response text before trying to parse as JSON
+      const responseText = await fetchResponse.text();
+      console.log('Direct fetch response text:', responseText);
+      
+      if (!fetchResponse.ok) {
+        console.error('Direct fetch error - Status:', fetchResponse.status);
+        console.error('Direct fetch error - Response:', responseText);
+        throw new Error(`HTTP ${fetchResponse.status}: ${responseText}`);
+      }
+      
+      // Try to parse as JSON
+      let response;
+      try {
+        response = JSON.parse(responseText);
+        console.log('Direct fetch response data (parsed):', response);
+      } catch (parseError) {
+        console.error('Failed to parse response as JSON:', parseError);
+        console.error('Raw response text:', responseText);
+        throw new Error('Invalid JSON response from server');
+      }
 
-      if (response.error) throw new Error(response.error);
+      if (response?.error) {
+        console.error('Edge function returned error:', response.error);
+        throw new Error(response.error);
+      }
 
+      console.log('Email sync completed:', response);
       toast.success('Email sync completed successfully');
+      
+      // Refresh the emails after sync
+      if (user) {
+        console.log('Refreshing emails after sync...');
+        const { data: emailsData, error: emailsError } = await supabase
+          .from('emails')
+          .select('*')
+          .eq('user_id', user.id)
+          .eq('store_id', storeId)
+          .order('date', { ascending: false });
+
+        if (emailsError) {
+          console.error('Error fetching emails after sync:', emailsError);
+        } else if (emailsData) {
+          console.log(`Found ${emailsData.length} emails for store ${storeId}`);
+          const store = stores.find(s => s.id === storeId);
+          const emailsWithStore = emailsData.map(email => ({
+            ...email,
+            storeName: store?.name || '',
+            storeColor: store?.color || '#2563eb'
+          }));
+          
+          // Update emails state by merging new emails
+          setEmails(prev => {
+            const filtered = prev.filter(e => e.store_id !== storeId);
+            return [...emailsWithStore, ...filtered].sort((a, b) => 
+              new Date(b.date).getTime() - new Date(a.date).getTime()
+            );
+          });
+          
+          console.log('Emails state updated successfully');
+        }
+      }
     } catch (error) {
       console.error('Error syncing emails:', error);
-      toast.error('Failed to sync emails');
+      const errorMessage = (error as any)?.message || 'Unknown error occurred';
+      toast.error(`Failed to sync emails: ${errorMessage}`);
+      throw error;
+    }
+  };
+
+  const refreshEmails = async () => {
+    if (!user) return;
+    
+    try {
+      console.log('InboxContext: Manual email refresh triggered');
+      setLoading(true);
+      
+      const { data: emailsData, error: emailsError } = await supabase
+        .from('emails')
+        .select('*')
+        .eq('user_id', user.id)
+        .order('date', { ascending: false });
+
+      if (emailsError) {
+        console.error('InboxContext: Error refreshing emails:', emailsError);
+        throw emailsError;
+      }
+
+      const { data: storesData, error: storesError } = await supabase
+        .from('stores')
+        .select('*')
+        .eq('user_id', user.id);
+
+      if (storesError) {
+        console.error('InboxContext: Error refreshing stores:', storesError);
+        throw storesError;
+      }
+
+      const emailsWithStore = (emailsData || []).map(email => {
+        const store = storesData?.find(s => s.id === email.store_id);
+        return {
+          ...email,
+          storeName: store?.name || '',
+          storeColor: store?.color || '#2563eb'
+        };
+      });
+
+      setEmails(emailsWithStore);
+      console.log('InboxContext: Manual refresh completed -', emailsWithStore.length, 'emails loaded');
+      toast.success('Emails refreshed successfully');
+    } catch (error) {
+      console.error('InboxContext: Manual refresh failed:', error);
+      toast.error('Failed to refresh emails');
+      throw error;
+    } finally {
+      setLoading(false);
     }
   };
 
@@ -379,8 +605,17 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }
 
       try {
-        await initializeMsal();
+        const msalInstance = await initializeMsal();
         setInitialized(true);
+
+        // Initialize token manager
+        const manager = new TokenManager(msalInstance);
+        setTokenManager(manager);
+
+        // Start periodic token refresh
+        const cleanup = manager.startPeriodicRefresh();
+        setPeriodicRefreshCleanup(() => cleanup);
+
       } catch (err) {
         console.error('Failed to initialize MSAL:', err);
         setError('Failed to initialize Microsoft authentication');
@@ -389,6 +624,13 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
       }
     };
     init();
+
+    // Cleanup on unmount
+    return () => {
+      if (periodicRefreshCleanup) {
+        periodicRefreshCleanup();
+      }
+    };
   }, []);
 
   useEffect(() => {
@@ -413,7 +655,8 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         const { data: emailsData, error: emailsError } = await supabase
           .from('emails')
           .select('*')
-          .eq('user_id', user.id);
+          .eq('user_id', user.id)
+          .order('date', { ascending: false });
 
         console.log('InboxContext: Emails query result:', { emailsData: emailsData?.length, emailsError });
 
@@ -423,17 +666,22 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
         }
 
         console.log('InboxContext: Setting stores and emails data');
-        setStores(storesData || []);
-        setEmails((emailsData || []).map(email => {
-          const store = storesData?.find(s => s.id === email.store_id);
+        const stores = storesData || [];
+        setStores(stores);
+        
+        const emailsWithStore = (emailsData || []).map(email => {
+          const store = stores.find(s => s.id === email.store_id);
           return {
             ...email,
             storeName: store?.name || '',
             storeColor: store?.color || '#2563eb'
           };
-        }));
+        });
+        
+        setEmails(emailsWithStore);
         
         console.log('InboxContext: Data loaded successfully');
+        console.log('InboxContext: Loaded', stores.length, 'stores and', emailsWithStore.length, 'emails');
       } catch (err) {
         console.error('InboxContext: Error loading data:', err);
         setError('Failed to load data: ' + (err as any)?.message);
@@ -444,21 +692,30 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
 
     loadData();
 
-    // Set up realtime subscription
+    // Set up realtime subscription with better error handling
+    console.log('InboxContext: Setting up real-time subscription');
     const subscription = supabase
-      .channel('emails')
+      .channel('inbox-emails')
       .on(
         'postgres_changes',
         {
           event: 'INSERT',
           schema: 'public',
           table: 'emails',
+          filter: `user_id=eq.${user.id}`
         },
         async (payload) => {
+          console.log('InboxContext: Received real-time email update:', payload);
           const newEmail = payload.new;
 
           if (newEmail.user_id === user.id) {
-            const store = stores.find(s => s.id === newEmail.store_id);
+            // Get the current stores to find the correct store info
+            const { data: currentStores } = await supabase
+              .from('stores')
+              .select('*')
+              .eq('user_id', user.id);
+
+            const store = currentStores?.find(s => s.id === newEmail.store_id);
             
             const emailWithStore = {
               ...newEmail,
@@ -466,21 +723,64 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
               storeColor: store?.color || '#2563eb'
             };
 
-            const exists = emails.some(e => e.graph_id === newEmail.graph_id);
-            if (!exists) {
-              setEmails(prev => [emailWithStore, ...prev]);
-              toast.success(`New email from ${newEmail.from}`);
-            }
+            // Check if email already exists to avoid duplicates
+            setEmails(prev => {
+              const exists = prev.some(e => e.graph_id === newEmail.graph_id);
+              if (!exists) {
+                console.log('InboxContext: Adding new email to state');
+                const updated = [emailWithStore, ...prev].sort((a, b) => 
+                  new Date(b.date).getTime() - new Date(a.date).getTime()
+                );
+                toast.success(`New email from ${newEmail.from}`);
+                return updated;
+              }
+              console.log('InboxContext: Email already exists, skipping');
+              return prev;
+            });
           }
         }
       )
-      .subscribe();
+      .on(
+        'postgres_changes',
+        {
+          event: 'UPDATE',
+          schema: 'public',
+          table: 'emails',
+          filter: `user_id=eq.${user.id}`
+        },
+        async (payload) => {
+          console.log('InboxContext: Received email update:', payload);
+          const updatedEmail = payload.new;
+          
+          // Get the current stores to find the correct store info
+          const { data: currentStores } = await supabase
+            .from('stores')
+            .select('*')
+            .eq('user_id', user.id);
+
+          const store = currentStores?.find(s => s.id === updatedEmail.store_id);
+          
+          const emailWithStore = {
+            ...updatedEmail,
+            storeName: store?.name || '',
+            storeColor: store?.color || '#2563eb'
+          };
+
+          setEmails(prev => prev.map(email => 
+            email.id === updatedEmail.id ? emailWithStore : email
+          ));
+        }
+      )
+      .subscribe((status) => {
+        console.log('InboxContext: Subscription status:', status);
+      });
 
     setRealtimeSubscription(subscription);
 
     return () => {
-      if (realtimeSubscription) {
-        supabase.removeChannel(realtimeSubscription);
+      console.log('InboxContext: Cleaning up subscriptions');
+      if (subscription) {
+        supabase.removeChannel(subscription);
       }
     };
   }, [user]);
@@ -495,6 +795,7 @@ export const InboxProvider: React.FC<{ children: React.ReactNode }> = ({ childre
     connectStore,
     disconnectStore,
     syncEmails,
+    refreshEmails,
     loading,
     error,
     pendingStore

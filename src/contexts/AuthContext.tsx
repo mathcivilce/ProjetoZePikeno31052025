@@ -146,31 +146,92 @@ export const AuthProvider: React.FC<{ children: React.ReactNode }> = ({ children
         },
       });
 
+      if (error) {
+        return { error };
+      }
+
       // If this is an invitation-based signup, call the accept-invitation function
-      if (!error && metadata?.invitation_token && data.user) {
+      if (metadata?.invitation_token && data.user) {
         try {
-          const acceptResponse = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/accept-invitation`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
-            },
-            body: JSON.stringify({ 
-              token: metadata.invitation_token,
-              user_id: data.user.id 
-            }),
-          });
+          console.log('AuthContext: Processing invitation acceptance for user:', data.user.id);
           
-          if (!acceptResponse.ok) {
-            console.warn('Failed to process invitation acceptance');
+          // Poll for session availability with retries
+          let session = null;
+          let attempts = 0;
+          const maxAttempts = 10; // 10 attempts = 5 seconds max
+          
+          while (!session && attempts < maxAttempts) {
+            await new Promise(resolve => setTimeout(resolve, 500)); // Wait 500ms between attempts
+            const { data: sessionData } = await supabase.auth.getSession();
+            
+            if (sessionData.session?.access_token) {
+              session = sessionData.session;
+              break;
+            }
+            
+            attempts++;
+            console.log(`AuthContext: Waiting for session... attempt ${attempts}/${maxAttempts}`);
           }
+          
+          if (!session?.access_token) {
+            console.warn('AuthContext: Session not available, using alternative approach');
+            // Use the service role approach via Edge Function without user session
+            const acceptResponse = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/accept-invitation`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${import.meta.env.VITE_SUPABASE_ANON_KEY}`,
+              },
+              body: JSON.stringify({ 
+                token: metadata.invitation_token,
+                user_id: data.user.id,
+                direct_call: true // Flag to indicate this is a direct call without user session
+              }),
+            });
+            
+            if (!acceptResponse.ok) {
+              const errorData = await acceptResponse.json();
+              console.error('AuthContext: Accept invitation failed (direct):', errorData);
+              throw new Error(errorData.error || 'Failed to process invitation');
+            }
+
+            const result = await acceptResponse.json();
+            console.log('AuthContext: Invitation processed successfully (direct):', result);
+          } else {
+            console.log('AuthContext: Session established, using authenticated approach');
+            
+            const acceptResponse = await fetch(`${import.meta.env.VITE_SUPABASE_URL}/functions/v1/accept-invitation`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${session.access_token}`,
+              },
+              body: JSON.stringify({ 
+                token: metadata.invitation_token,
+                user_id: data.user.id 
+              }),
+            });
+            
+            if (!acceptResponse.ok) {
+              const errorData = await acceptResponse.json();
+              console.error('AuthContext: Accept invitation failed (authenticated):', errorData);
+              throw new Error(errorData.error || 'Failed to process invitation');
+            }
+
+            const result = await acceptResponse.json();
+            console.log('AuthContext: Invitation processed successfully (authenticated):', result);
+          }
+          
         } catch (inviteError) {
-          console.warn('Error processing invitation:', inviteError);
+          console.error('AuthContext: Error processing invitation:', inviteError);
+          // This is critical - if invitation processing fails, the user won't have a profile
+          throw new Error(`Account created but invitation processing failed: ${inviteError.message}`);
         }
       }
 
-      return { error };
+      return { error: null };
     } catch (error) {
+      console.error('AuthContext: SignUp error:', error);
       return { error };
     } finally {
       setLoading(false);
